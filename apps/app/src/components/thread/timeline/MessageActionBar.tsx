@@ -52,6 +52,7 @@ interface MessageActionBarProps {
     text: string,
     attachments?: readonly PromptDraftAttachment[],
   ) => void;
+  onCopyLink?: () => void;
   onEdit?: () => void;
   onFork?: () => void;
   onSendToMain?: () => void;
@@ -60,7 +61,13 @@ interface MessageActionBarProps {
 }
 
 interface MessageOverflowAction {
-  icon: "Copy" | "Edit" | "MessageSquarePlus" | "Fork" | "ArrowTurnBackward";
+  icon:
+    | "Copy"
+    | "Link"
+    | "Edit"
+    | "MessageSquarePlus"
+    | "Fork"
+    | "ArrowTurnBackward";
   plugin?: { pluginId: string | null; icon: string | null };
   key?: string;
   label: string;
@@ -301,6 +308,7 @@ export function MessageActionBar({
   addToChatAttachments = [],
   copyImageUrl,
   onAddToChat,
+  onCopyLink,
   onEdit,
   onFork,
   onSendToMain,
@@ -354,6 +362,15 @@ export function MessageActionBar({
             copyText: messageText,
             copyImageUrl,
             kind: "copy" as const,
+          },
+        ]
+      : []),
+    ...(onCopyLink
+      ? [
+          {
+            icon: "Link" as const,
+            label: "Copy link to message",
+            onSelect: onCopyLink,
           },
         ]
       : []),
