@@ -45,7 +45,7 @@ bb pool account refresh <id>
 bb pool status [--json]
 bb pool routing <claude|codex> [--off]
 bb pool config
-bb pool config set <anthropicUpstreamBaseUrl|codexUpstreamBaseUrl|switchThreshold> <value>
+bb pool config set <anthropicUpstreamBaseUrl|codexUpstreamBaseUrl|switchThreshold|parentMode|selectionMode|balanceThreshold> <value>
 bb pool token rotate --machine <id-or-name>
 bb pool bypass <thread-id> [--off]
 ```
@@ -90,7 +90,34 @@ URLs. Use `bb pool config set <key> <value>` to change one; the two URL values
 are QA-only overrides. Upgrading from a build that stored these values through
 plugin settings resets the threshold and QA overrides to their defaults.
 
-Accounts run sequentially per provider: lower priority numbers first, with ties
+The optional `selectionMode: least-usage` assigns each new conversation to the
+eligible account with the lowest utilization. Its score is the highest usage
+fraction across active shared and requested model-family windows; expired windows
+count as zero. Known usage sorts ahead of unknown usage, ties use priority and
+addition order, and included OAuth quota sorts ahead of metered fallback.
+`balanceThreshold` defaults to `0.05` (five percentage points): keep the account
+currently preferred for new conversations until another is at least that much
+lower. Set it to `0` to always choose the least-used account. This margin is
+independent of the exhaustion `switchThreshold`.
+
+In Least usage mode, a conversation is assigned on its first request. Its pin
+persists in the plugin database without idle expiry or cache eviction, including
+across plugin reloads. Requests wait or return errors when the assigned account
+is held, exhausted, disabled, removed, or fails; they never silently fail over,
+including model-family limits. Existing surviving priority pins are adopted on
+first use. Restoring Priority mode affects new conversations; persistent Least
+usage assignments remain pinned. Forked conversations choose independently.
+Requests without a provider session identifier are selected individually.
+No configuration or quota records are lost on upgrade; absent settings default
+to Priority mode with a five-point margin.
+
+```sh
+bb pool config set selectionMode least-usage
+bb pool config set balanceThreshold 0.05
+bb pool config set selectionMode priority
+```
+
+In the default Priority mode, accounts run sequentially per provider: lower priority numbers first, with ties
 following the order accounts were added. New conversations use the current
 account until it reaches the switch threshold or fails; the pool then advances
 to the next eligible account and wraps at the end. It keeps using that fallback

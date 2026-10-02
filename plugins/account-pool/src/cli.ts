@@ -34,7 +34,7 @@ import type { ClaudeOAuthLogin } from "./oauth-login.js";
 import type { CodexDeviceLogin } from "./codex-device-login.js";
 
 const DESCRIPTION = [
-  "Accounts run sequentially by priority, then order added. The current fallback stays active until unavailable.",
+  "Priority mode runs accounts sequentially by priority, then order added. Least usage mode balances new conversations with a configurable margin and persistent account assignments.",
   "When this bb server runs inside another bb server's thread, parent proxy routes its pooled traffic through that parent; isolate neutralises the inherited routing.",
   "Reorder includes every account for the provider and changes the next failover sequence; existing conversations stay pinned.",
 ].join("\n");
@@ -186,6 +186,8 @@ function formatConfig(config: AccountPoolConfig): string {
     `codexUpstreamBaseUrl: ${config.codexUpstreamBaseUrl}`,
     `switchThreshold: ${config.switchThreshold}`,
     `parentMode: ${config.parentMode}`,
+    `selectionMode: ${config.selectionMode}`,
+    `balanceThreshold: ${config.balanceThreshold}`,
   ].join("\n");
 }
 
@@ -220,11 +222,17 @@ function parseConfigUpdate(
       switchThreshold: Number(value),
     });
   }
+  if (key === "selectionMode")
+    return accountPoolConfigSetInputSchema.parse({ selectionMode: value });
+  if (key === "balanceThreshold")
+    return accountPoolConfigSetInputSchema.parse({
+      balanceThreshold: Number(value),
+    });
   if (key === "parentMode") {
     return accountPoolConfigSetInputSchema.parse({ parentMode: value });
   }
   throw new PluginCliError(
-    "Config key must be anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, or parentMode.",
+    "Config key must be anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, parentMode, selectionMode, or balanceThreshold.",
     { code: "invalid_value" },
   );
 }
@@ -730,13 +738,13 @@ export function registerPoolCli(
             {
               name: "key",
               description:
-                "anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, or parentMode",
+                "anthropicUpstreamBaseUrl, codexUpstreamBaseUrl, switchThreshold, parentMode, selectionMode, or balanceThreshold",
               required: true,
             },
             {
               name: "value",
               description:
-                "HTTP(S) URL for the upstream keys, a number above 0 and at most 1 for switchThreshold, proxy or isolate for parentMode",
+                "HTTP(S) URL for the upstream keys, a number above 0 and at most 1 for switchThreshold, proxy or isolate for parentMode, priority or least-usage for selectionMode, a fraction from 0 to 1 for balanceThreshold",
               required: true,
             },
           ],

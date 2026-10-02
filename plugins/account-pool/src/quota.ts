@@ -334,3 +334,24 @@ export function retryAfterMilliseconds(
   const date = Date.parse(value);
   return Number.isNaN(date) ? 1_000 : Math.max(0, date - now);
 }
+
+export function routingUtilization(
+  quota: AccountQuota,
+  family: ModelFamily,
+  now: number,
+): number | null {
+  const windows = [
+    { utilization: quota.fiveHourUtilization, resetAt: quota.fiveHourResetAt },
+    { utilization: quota.sevenDayUtilization, resetAt: quota.sevenDayResetAt },
+    ...quota.limitWindows,
+    ...(quota.familyWeekly[family] === null
+      ? []
+      : [quota.familyWeekly[family]]),
+  ];
+  const values = windows.flatMap(({ utilization, resetAt }) =>
+    utilization === null || !Number.isFinite(utilization)
+      ? []
+      : [resetAt !== null && resetAt <= now ? 0 : utilization],
+  );
+  return values.length === 0 ? null : Math.max(...values);
+}

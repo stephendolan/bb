@@ -8,6 +8,8 @@ import type {
   PoolStatus,
 } from "./src/contracts.js";
 
+import { accountPoolConfigSetInputSchema } from "./src/contracts.js";
+
 const app = await loadPluginApp(() => import("./app"));
 afterEach(() => {
   cleanup();
@@ -110,6 +112,8 @@ function config(overrides: Partial<AccountPoolConfig> = {}): AccountPoolConfig {
     anthropicUpstreamBaseUrl: "https://api.anthropic.com",
     codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
     switchThreshold: 0.98,
+    selectionMode: "priority",
+    balanceThreshold: 0.05,
     parentMode: "proxy",
     ...overrides,
   };
@@ -213,6 +217,76 @@ describe("Account Pool parent banner", () => {
 });
 
 describe("Account Pool settings", () => {
+  it("saves the balance margin as percentage points and displays the saved value", async () => {
+    let saved = config({ selectionMode: "least-usage" });
+    const slot = renderSlot(
+      app.settingsSections[0]!,
+      {},
+      {
+        rpc: {
+          "status.get": () => status(),
+          "config.get": () => saved,
+          "config.set": (input) => {
+            saved = { ...saved, ...accountPoolConfigSetInputSchema.parse(input) };
+            return saved;
+          },
+        },
+        openUrl: () => true,
+      },
+    );
+    const margin = await slot.findByRole("spinbutton", {
+      name: "Balance margin",
+    });
+    expect((margin as HTMLInputElement).value).toBe("5");
+    fireEvent.change(margin, { target: { value: "10" } });
+    fireEvent.blur(margin);
+    await waitFor(() => expect(saved.balanceThreshold).toBe(0.1));
+    expect((margin as HTMLInputElement).value).toBe("10");
+    expect(slot.rpcCalls).toContainEqual({
+      method: "config.set",
+      input: { balanceThreshold: 0.1 },
+    });
+    fireEvent.change(margin, { target: { value: "-1" } });
+    fireEvent.blur(margin);
+    expect((await slot.findByRole("alert")).textContent).toBe(
+      "Must be between 0 and 100 percentage points.",
+    );
+    expect(saved.balanceThreshold).toBe(0.1);
+  });
+
+  it("changes the routing mode from the settings menu", async () => {
+    let saved = config();
+    const slot = renderSlot(
+      app.settingsSections[0]!,
+      {},
+      {
+        rpc: {
+          "status.get": () => status(),
+          "config.get": () => saved,
+          "config.set": (input) => {
+            saved = { ...saved, ...accountPoolConfigSetInputSchema.parse(input) };
+            return saved;
+          },
+        },
+        openUrl: () => true,
+      },
+    );
+    const selection = await slot.findByRole("button", {
+      name: "Account selection",
+    });
+    await waitFor(() => expect(selection.hasAttribute("disabled")).toBe(false));
+    fireEvent.keyDown(selection, { key: "ArrowDown" });
+    fireEvent.click(await slot.findByRole("menuitem", { name: "Least usage" }));
+    expect(
+      (
+        (await slot.findByRole("spinbutton", {
+          name: "Balance margin",
+        })) as HTMLInputElement
+      ).value,
+    ).toBe("5");
+    expect(saved.selectionMode).toBe("least-usage");
+  });
+
   it("renders cached accounts as refreshing until live status arrives, then caches it", async () => {
     window.localStorage.setItem(
       STATUS_CACHE_KEY,

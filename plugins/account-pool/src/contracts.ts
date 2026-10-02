@@ -4,6 +4,8 @@ export const DEFAULT_ACCOUNT_POOL_CONFIG = {
   anthropicUpstreamBaseUrl: "https://api.anthropic.com",
   codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
   switchThreshold: 0.98,
+  selectionMode: "priority" as const,
+  balanceThreshold: 0.05,
   parentMode: "proxy" as const,
 };
 
@@ -21,6 +23,9 @@ const switchThresholdSchema = z
   .positive("Must be greater than 0.")
   .max(1, "Must be at most 1.");
 
+export const selectionModeSchema = z.enum(["priority", "least-usage"]);
+const balanceThresholdSchema = z.number().min(0).max(1);
+
 export const parentModeSchema = z.enum(["proxy", "isolate"]);
 
 export const accountPoolConfigSchema = z
@@ -33,6 +38,12 @@ export const accountPoolConfigSchema = z
     ),
     switchThreshold: switchThresholdSchema.default(
       DEFAULT_ACCOUNT_POOL_CONFIG.switchThreshold,
+    ),
+    selectionMode: selectionModeSchema.default(
+      DEFAULT_ACCOUNT_POOL_CONFIG.selectionMode,
+    ),
+    balanceThreshold: balanceThresholdSchema.default(
+      DEFAULT_ACCOUNT_POOL_CONFIG.balanceThreshold,
     ),
     parentMode: parentModeSchema.default(
       DEFAULT_ACCOUNT_POOL_CONFIG.parentMode,
@@ -48,6 +59,8 @@ export const accountPoolConfigSetInputSchema = z
     codexUpstreamBaseUrl: httpUrlSchema.optional(),
     switchThreshold: switchThresholdSchema.optional(),
     parentMode: parentModeSchema.optional(),
+    selectionMode: selectionModeSchema.optional(),
+    balanceThreshold: balanceThresholdSchema.optional(),
   })
   .strict();
 

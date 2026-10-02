@@ -360,6 +360,8 @@ describe("Account Pool config schema", () => {
       codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
       switchThreshold: 0.98,
       parentMode: "proxy",
+      selectionMode: "priority",
+      balanceThreshold: 0.05,
     });
     expect(
       accountPoolConfigSetInputSchema.safeParse({
@@ -460,6 +462,8 @@ describe("Account Pool plugin", () => {
       codexUpstreamBaseUrl: "https://chatgpt.com/backend-api/codex",
       switchThreshold: 0.75,
       parentMode: "proxy",
+      selectionMode: "priority",
+      balanceThreshold: 0.05,
     });
     expect(
       accountPoolConfigSchema.parse(await host.bb.storage.kv.get("config")),
@@ -3698,6 +3702,257 @@ describe("Account Pool plugin", () => {
         });
       return fixture;
     }
+
+    describe("least usage routing", () => {
+      async function balancedFixture(provider: "claude" | "codex") {
+        let now = 1_800_000_000_000;
+        const usage: Record<string, number> = {
+          "sk-first": 0.4,
+          "sk-second": 0.7,
+        };
+        const failures: Record<string, number> = {};
+        const upstreamFetch: typeof fetch = async (input, init) => {
+          if (String(input) === EMPTY_USAGE_URL) return Response.json({});
+          const headers = new Headers(init?.headers);
+          const key =
+            headers.get("x-api-key") ??
+            headers.get("authorization")?.slice(7) ??
+            "";
+          const status = failures[key] ?? 200;
+          return Response.json(
+            { account: key },
+            {
+              status,
+              headers:
+                provider === "claude"
+                  ? {
+                      "anthropic-ratelimit-unified-7d-utilization": String(
+                        usage[key],
+                      ),
+                      "anthropic-ratelimit-unified-7d-reset": String(
+                        (now + 86400000) / 1000,
+                      ),
+                      ...(status === 429
+                        ? {
+                            "anthropic-ratelimit-unified-7d-status": "rejected",
+                          }
+                        : {}),
+                    }
+                  : {
+                      "x-codex-primary-used-percent": String(usage[key]! * 100),
+                      "x-codex-primary-window-minutes": "10080",
+                      "x-codex-primary-reset-at": String(
+                        (now + 86400000) / 1000,
+                      ),
+                    },
+            },
+          );
+        };
+        const fixture = await affinityFixture(
+          provider,
+          upstreamFetch,
+          () => now,
+        );
+        let host = fixture.host;
+        const send = async (id: string) => {
+          const response = await host.harness.behavior.fetchHttp(
+            "POST",
+            provider === "claude" ? "/v1/messages" : "/v1/responses",
+            {
+              headers: { ...authHeaders(fixture.key), "session-id": id },
+              body: provider === "claude" ? claudeBody(id) : "{}",
+            },
+          );
+          return { status: response.status, body: await response.json() };
+        };
+        expect(await send("seed-first")).toEqual({
+          status: 200,
+          body: { account: "sk-first" },
+        });
+        await host.harness.behavior.callRpc("account.disable", {
+          id: fixture.account.id,
+        });
+        expect(await send("seed-second")).toEqual({
+          status: 200,
+          body: { account: "sk-second" },
+        });
+        await host.harness.behavior.callRpc("account.enable", {
+          id: fixture.account.id,
+        });
+        const result = await host.harness.behavior.runCli([
+          "config",
+          "set",
+          "selectionMode",
+          "least-usage",
+          "--json",
+        ]);
+        expect(result.exitCode).toBe(0);
+        return {
+          fixture,
+          usage,
+          failures,
+          send,
+          setMargin: async (value: string) =>
+            host.harness.behavior.runCli([
+              "config",
+              "set",
+              "balanceThreshold",
+              value,
+            ]),
+          reload: async () => {
+            now += 60 * 60 * 1000;
+            host = await host.harness.lifecycle.reload(
+              createAccountPoolPlugin({
+                fetch: upstreamFetch,
+                now: () => now,
+                usageUrl: EMPTY_USAGE_URL,
+                codexUsageUrl: EMPTY_USAGE_URL,
+              }),
+            );
+            const service = host.harness.behavior.runService("hub");
+            cleanups.push(async () => {
+              service.controller.abort();
+              await service.done;
+              await host.harness.lifecycle.dispose();
+            });
+            await vi.waitFor(async () =>
+              expect(
+                statusSchema.parse(
+                  await host.harness.behavior.callRpc("status.get", null),
+                ).accepting,
+              ).toBe(true),
+            );
+          },
+        };
+      }
+
+      it.each(["claude", "codex"] as const)(
+        "balances new %s conversations with a five-point margin and retains older assignments",
+        async (provider) => {
+          const pool = await balancedFixture(provider);
+          expect(await pool.send("original")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+          pool.usage["sk-first"] = 0.74;
+          await pool.send("original");
+          expect(await pool.send("within-margin")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+          pool.usage["sk-first"] = 0.75;
+          await pool.send("original");
+          expect(await pool.send("new-after-margin")).toEqual({
+            status: 200,
+            body: { account: "sk-second" },
+          });
+          expect(await pool.send("original")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+          expect(await pool.send("within-margin")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+        },
+      );
+
+      it.each(["claude", "codex"] as const)(
+        "keeps %s assignments after idle expiry and full reload",
+        async (provider) => {
+          const pool = await balancedFixture(provider);
+          expect(await pool.send("original")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+          pool.usage["sk-first"] = 0.9;
+          await pool.send("original");
+          expect(await pool.send("second")).toEqual({
+            status: 200,
+            body: { account: "sk-second" },
+          });
+          await pool.reload();
+          expect(await pool.send("original")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+          expect(await pool.send("second")).toEqual({
+            status: 200,
+            body: { account: "sk-second" },
+          });
+        },
+      );
+
+      it.each(["claude", "codex"] as const)(
+        "returns %s failures without moving the conversation to a healthy account",
+        async (provider) => {
+          const pool = await balancedFixture(provider);
+          expect(await pool.send("original")).toEqual({
+            status: 200,
+            body: { account: "sk-first" },
+          });
+          pool.failures["sk-first"] = 503;
+          expect((await pool.send("original")).status).toBe(503);
+          pool.failures["sk-first"] = 200;
+          pool.usage["sk-first"] = 0.99;
+          await pool.send("original");
+          expect((await pool.send("original")).status).toBe(429);
+          expect(await pool.send("fresh")).toEqual({
+            status: 200,
+            body: { account: "sk-second" },
+          });
+          await pool.fixture.host.harness.behavior.callRpc("account.disable", {
+            id: pool.fixture.account.id,
+          });
+          expect((await pool.send("original")).status).toBe(503);
+        },
+      );
+
+      it.each(["claude", "codex"] as const)(
+        "persists an unavailable adopted %s priority assignment before returning an error",
+        async (provider) => {
+          const pool = await balancedFixture(provider);
+          await pool.fixture.host.harness.behavior.callRpc("account.disable", {
+            id: pool.fixture.account.id,
+          });
+          expect((await pool.send("seed-first")).status).toBe(503);
+          await pool.reload();
+          expect((await pool.send("seed-first")).status).toBe(503);
+          expect(await pool.send("fresh")).toEqual({
+            status: 200,
+            body: { account: "sk-second" },
+          });
+        },
+      );
+
+      it("applies a custom margin and preserves assignments when priority mode is restored", async () => {
+        const pool = await balancedFixture("codex");
+        expect((await pool.setMargin("0.1")).exitCode).toBe(0);
+        expect(await pool.send("original")).toEqual({
+          status: 200,
+          body: { account: "sk-first" },
+        });
+        pool.usage["sk-first"] = 0.76;
+        await pool.send("original");
+        expect(await pool.send("within-ten-points")).toEqual({
+          status: 200,
+          body: { account: "sk-first" },
+        });
+        pool.usage["sk-first"] = 0.8;
+        await pool.send("original");
+        expect(await pool.send("new")).toEqual({
+          status: 200,
+          body: { account: "sk-second" },
+        });
+        await pool.fixture.host.harness.behavior.callRpc("config.set", {
+          selectionMode: "priority",
+        });
+        expect(await pool.send("original")).toEqual({
+          status: 200,
+          body: { account: "sk-first" },
+        });
+      });
+    });
 
     it.each(["claude", "codex"] as const)(
       "keeps %s sessions and the pool cursor on the third account after two failures",

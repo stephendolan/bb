@@ -29,6 +29,7 @@ import {
   isSharedQuotaExhausted,
   isUsageRestricted,
   retryAfterMilliseconds,
+  routingUtilization,
 } from "./quota.js";
 import type {
   AccountBinding,
@@ -99,6 +100,7 @@ interface PacingFlight {
 }
 
 interface RoutingAttempt {
+  strictAffinity: boolean;
   binding: AccountBinding | null;
   active: ActiveAccount | null;
   pinnedAccountId: string | null;
@@ -412,6 +414,7 @@ export class AccountPoolHub {
     const attempted = new Set<string>();
     const waited = new Set<string>();
     const routing: RoutingAttempt = {
+      strictAffinity: false,
       binding: null,
       active: null,
       pinnedAccountId: null,
@@ -706,7 +709,15 @@ export class AccountPoolHub {
       }
       signal.throwIfAborted();
       return failure === null
-        ? this.noEligibleResponse(accounts, family, adapter)
+        ? this.noEligibleResponse(
+            routing.strictAffinity && routing.pinnedAccountId !== null
+              ? accounts.filter(
+                  (account) => account.id === routing.pinnedAccountId,
+                )
+              : accounts,
+            family,
+            adapter,
+          )
         : adapter.errorResponse(
             failure.status,
             failure.message,
@@ -830,6 +841,22 @@ export class AccountPoolHub {
     routing: RoutingAttempt,
     signal: AbortSignal,
   ): Promise<SelectedAccount | null> {
+    if (
+      this.options.getSettings().selectionMode === "least-usage" ||
+      routing.strictAffinity ||
+      (affinityKey !== null &&
+        this.options.affinity.threadBinding(affinityKey) !== null)
+    ) {
+      return this.selectLeastUsage(
+        provider,
+        candidateIds,
+        attempted,
+        family,
+        affinityKey,
+        routing,
+        signal,
+      );
+    }
     const accounts = (await this.options.accounts.list()).sort(
       (left, right) => left.priority - right.priority,
     );
@@ -989,6 +1016,109 @@ export class AccountPoolHub {
         }
       },
     };
+  }
+
+  private async selectLeastUsage(
+    provider: PoolProvider,
+    candidateIds: ReadonlySet<string>,
+    attempted: ReadonlySet<string>,
+    family: ModelFamily,
+    affinityKey: string | null,
+    routing: RoutingAttempt,
+    signal: AbortSignal,
+  ): Promise<SelectedAccount | null> {
+    routing.strictAffinity = true;
+    const accounts = (await this.options.accounts.list()).filter(
+      (account) => account.provider === provider,
+    );
+    signal.throwIfAborted();
+    const now = this.options.now();
+    const settings = this.options.getSettings();
+    const binding =
+      affinityKey === null
+        ? null
+        : (this.options.affinity.threadBinding(affinityKey) ??
+          this.affinityBindings.get(affinityKey) ??
+          null);
+    const pinnedId = binding?.accountId ?? routing.pinnedAccountId;
+    routing.pinnedAccountId = pinnedId;
+    if (affinityKey !== null && binding !== null) {
+      this.options.affinity.putThreadBinding(affinityKey, {
+        ...binding,
+        lastUsedAt: now,
+      });
+    }
+    const eligible = accounts
+      .filter(
+        (account) =>
+          account.enabled &&
+          candidateIds.has(account.id) &&
+          !attempted.has(account.id),
+      )
+      .map((account) => ({
+        account,
+        quota: this.options.quotas.get(account.id),
+      }))
+      .filter(
+        ({ quota }) =>
+          quota.error === null &&
+          !isUsageRestricted(quota, now) &&
+          (!isQuotaExhausted(quota, family, settings.switchThreshold, now) ||
+            hasExtraUsage(quota)),
+      );
+    let selected: (typeof eligible)[number] | undefined;
+    if (pinnedId !== null) {
+      selected = eligible.find(({ account }) => account.id === pinnedId);
+    } else {
+      let candidates = eligible.filter(
+        ({ quota }) => quota.heldUntil === null || quota.heldUntil <= now,
+      );
+      const included = candidates.filter(
+        ({ account, quota }) =>
+          account.kind === "oauth" &&
+          !isQuotaExhausted(quota, family, settings.switchThreshold, now),
+      );
+      if (included.length > 0) candidates = included;
+      const measured = candidates.filter(
+        ({ quota }) => routingUtilization(quota, family, now) !== null,
+      );
+      if (measured.length > 0) candidates = measured;
+      candidates.sort(
+        (left, right) =>
+          (routingUtilization(left.quota, family, now) ?? Infinity) -
+            (routingUtilization(right.quota, family, now) ?? Infinity) ||
+          left.account.priority - right.account.priority,
+      );
+      selected = candidates[0];
+      const active = candidates.find(
+        ({ account }) =>
+          account.id === this.activeAccounts.get(provider)?.accountId,
+      );
+      if (active !== undefined && selected !== undefined) {
+        const currentUsage = routingUtilization(active.quota, family, now);
+        const lowestUsage = routingUtilization(selected.quota, family, now);
+        if (
+          currentUsage === null ||
+          lowestUsage === null ||
+          currentUsage <= lowestUsage ||
+          currentUsage - lowestUsage + Number.EPSILON <
+            settings.balanceThreshold
+        )
+          selected = active;
+      }
+      if (selected !== undefined) {
+        this.options.affinity.putActiveAccount(provider, selected.account.id);
+        this.activeAccounts.set(provider, { accountId: selected.account.id });
+      }
+    }
+    if (selected === undefined) return null;
+    routing.pinnedAccountId = selected.account.id;
+    if (affinityKey !== null)
+      this.options.affinity.putThreadBinding(affinityKey, {
+        accountId: selected.account.id,
+        lastUsedAt: now,
+      });
+    return { ...selected, keepAffinity: true, accept: () => {} };
   }
 
   private async freshSecret(

@@ -699,6 +699,24 @@ export class PoolAffinityStore {
     );
   }
 
+  threadBinding(key: string): AccountBinding | null {
+    const row = this.db
+      .prepare(
+        "SELECT account_id, last_used_at FROM pool_thread_affinity WHERE affinity_key = ?",
+      )
+      .get(key);
+    if (row === undefined) return null;
+    const parsed = affinityRowSchema.omit({ affinity_key: true }).parse(row);
+    return { accountId: parsed.account_id, lastUsedAt: parsed.last_used_at };
+  }
+
+  putThreadBinding(key: string, binding: AccountBinding): void {
+    this.db
+      .prepare(`INSERT INTO pool_thread_affinity (affinity_key, account_id, last_used_at) VALUES (?, ?, ?)
+      ON CONFLICT(affinity_key) DO UPDATE SET last_used_at = excluded.last_used_at`)
+      .run(key, binding.accountId, binding.lastUsedAt);
+  }
+
   loadActiveAccounts(): Map<PoolProvider, { accountId: string }> {
     return new Map(
       z
@@ -761,4 +779,9 @@ export const QUOTA_MIGRATIONS = [
   )`,
   `ALTER TABLE account_quota ADD COLUMN extra_usage_json TEXT NOT NULL DEFAULT 'null'`,
   `ALTER TABLE account_quota ADD COLUMN usage_restriction_json TEXT NOT NULL DEFAULT 'null'`,
+  `CREATE TABLE pool_thread_affinity (
+    affinity_key TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    last_used_at INTEGER NOT NULL
+  )`,
 ];

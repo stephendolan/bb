@@ -85,7 +85,10 @@ type DialogState =
   | { kind: "claude-login" | "codex-login" | "api-key" }
   | null;
 
-type ConfigField = Exclude<keyof AccountPoolConfig, "parentMode">;
+type ConfigField = Exclude<
+  keyof AccountPoolConfig,
+  "parentMode" | "selectionMode"
+>;
 
 const PROVIDERS: Array<{
   id: PoolProvider;
@@ -132,6 +135,7 @@ function configDrafts(config: AccountPoolConfig): Record<ConfigField, string> {
     anthropicUpstreamBaseUrl: config.anthropicUpstreamBaseUrl,
     codexUpstreamBaseUrl: config.codexUpstreamBaseUrl,
     switchThreshold: String(config.switchThreshold),
+    balanceThreshold: String(config.balanceThreshold * 100),
   };
 }
 function parentHost(baseUrl: string): string {
@@ -659,7 +663,11 @@ function QuotaDetail({
 type CopyState = "idle" | "copied" | "manual";
 
 function useCopyToClipboard(text: string, selectFallback: () => void) {
-  const [copyState, setCopyState] = useState<CopyState>("idle");
+  const [copied, setCopied] = useState<{ text: string; state: CopyState }>({
+    text,
+    state: "idle",
+  });
+  const copyState = copied.text === text ? copied.state : "idle";
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
     () => () => {
@@ -667,21 +675,20 @@ function useCopyToClipboard(text: string, selectFallback: () => void) {
     },
     [],
   );
-  useEffect(() => {
-    if (timerRef.current !== null) clearTimeout(timerRef.current);
-    setCopyState("idle");
-  }, [text]);
 
   const copy = useCallback(() => {
     navigator.clipboard.writeText(text).then(
       () => {
-        setCopyState("copied");
+        setCopied({ text, state: "copied" });
         if (timerRef.current !== null) clearTimeout(timerRef.current);
-        timerRef.current = setTimeout(() => setCopyState("idle"), 1500);
+        timerRef.current = setTimeout(
+          () => setCopied({ text, state: "idle" }),
+          1500,
+        );
       },
       () => {
         selectFallback();
-        setCopyState("manual");
+        setCopied({ text, state: "manual" });
       },
     );
   }, [text, selectFallback]);
@@ -858,6 +865,7 @@ function AccountPoolSettings() {
     anthropicUpstreamBaseUrl: "",
     codexUpstreamBaseUrl: "",
     switchThreshold: "",
+    balanceThreshold: "",
   });
   const [configErrors, setConfigErrors] = useState<
     Record<ConfigField, string | null>
@@ -865,6 +873,7 @@ function AccountPoolSettings() {
     anthropicUpstreamBaseUrl: null,
     codexUpstreamBaseUrl: null,
     switchThreshold: null,
+    balanceThreshold: null,
   });
   const [dialog, setDialog] = useState<DialogState>(null);
   const [error, setError] = useState<string | null>(null);
@@ -916,8 +925,8 @@ function AccountPoolSettings() {
   }, [applyConfig, rpc]);
   useEffect(() => {
     mounted.current = true;
-    void refresh();
-    void refreshConfig();
+    void Promise.resolve().then(refresh);
+    void Promise.resolve().then(refreshConfig);
     return () => {
       mounted.current = false;
     };
@@ -993,23 +1002,29 @@ function AccountPoolSettings() {
   async function saveConfigField(field: ConfigField): Promise<void> {
     if (config === null || pending !== null) return;
     let update: AccountPoolConfigSetInput;
-    if (field === "switchThreshold") {
-      const raw = drafts.switchThreshold.trim();
-      const value = Number(raw);
+    if (field === "switchThreshold" || field === "balanceThreshold") {
+      const raw = drafts[field].trim();
+      const value = Number(raw) / (field === "balanceThreshold" ? 100 : 1);
       if (
         raw.length === 0 ||
         !Number.isFinite(value) ||
-        value <= 0 ||
+        (field === "switchThreshold" ? value <= 0 : value < 0) ||
         value > 1
       ) {
         setConfigErrors((current) => ({
           ...current,
-          switchThreshold: "Must be greater than 0 and at most 1.",
+          [field]:
+            field === "balanceThreshold"
+              ? "Must be between 0 and 100 percentage points."
+              : "Must be greater than 0 and at most 1.",
         }));
         return;
       }
-      if (value === config.switchThreshold) return;
-      update = { switchThreshold: value };
+      if (value === config[field]) return;
+      update =
+        field === "switchThreshold"
+          ? { switchThreshold: value }
+          : { balanceThreshold: value };
     } else {
       const value = drafts[field].trim();
       const validationError = httpUrlError(value);
@@ -1297,6 +1312,80 @@ function AccountPoolSettings() {
             </SettingsSection>
           );
         })}
+        <SettingsSection
+          title="Routing policy"
+          description="Choose how new conversations are assigned to accounts."
+          action={null}
+        >
+          <ConfigFieldRow
+            label="Account selection"
+            description={
+              config?.selectionMode === "least-usage"
+                ? "Choose by the highest usage across active quota windows. Conversations keep their account across restarts; errors never switch accounts."
+                : "Use accounts in priority order, keeping the current fallback until it becomes unavailable."
+            }
+            error={null}
+          >
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  className="w-full justify-between"
+                  disabled={config === null || pending !== null}
+                  aria-label="Account selection"
+                >
+                  {config?.selectionMode === "least-usage"
+                    ? "Least usage"
+                    : "Priority"}
+                  <Icon name="ChevronDown" className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {(["priority", "least-usage"] as const).map((selectionMode) => (
+                  <DropdownMenuItem
+                    key={selectionMode}
+                    onSelect={() =>
+                      void run("selection-mode", async () =>
+                        applyConfig(
+                          await rpc.call("config.set", { selectionMode }),
+                        ),
+                      )
+                    }
+                  >
+                    {selectionMode === "priority" ? "Priority" : "Least usage"}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </ConfigFieldRow>
+          {config?.selectionMode === "least-usage" ? (
+            <ConfigFieldRow
+              label="Balance margin"
+              description="Change the account for new conversations when another is this many percentage points lower. Existing conversations stay pinned."
+              error={configErrors.balanceThreshold}
+            >
+              <Input
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                aria-label="Balance margin"
+                aria-invalid={
+                  configErrors.balanceThreshold === null ? undefined : true
+                }
+                disabled={pending !== null}
+                value={drafts.balanceThreshold}
+                onChange={(event) =>
+                  updateConfigDraft("balanceThreshold", event.target.value)
+                }
+                onBlur={() => void saveConfigField("balanceThreshold")}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") event.currentTarget.blur();
+                }}
+              />
+            </ConfigFieldRow>
+          ) : null}
+        </SettingsSection>
         <Collapsible className="rounded-lg border border-border px-4">
           <CollapsibleTrigger className="flex w-full items-center gap-2 py-2.5 text-sm font-medium text-foreground">
             <Icon
