@@ -3349,13 +3349,35 @@ describe("Account Pool plugin", () => {
 
       const stillRejected = await refresh();
       expect(refreshCalls).toBe(2);
-      expect(stillRejected?.error).toBe("OAuth refresh failed with HTTP 400.");
+      expect(stillRejected?.error).toBe(
+        "OAuth refresh failed with HTTP 400. invalid_grant.",
+      );
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual({
+        level: "warn",
+        message: expect.stringContaining(
+          `Account Pooler ${provider} account ${fixture.account.id} OAuth refresh failed`,
+        ),
+      });
 
       refreshStatus = 200;
       const recovered = await refresh();
       expect(refreshCalls).toBe(3);
       expect(recovered?.error).toBeNull();
+      expect(fixture.host.harness.inspection.logEntries).toContainEqual({
+        level: "info",
+        message: expect.stringContaining(
+          `Account Pooler ${provider} account ${fixture.account.id} OAuth refresh succeeded`,
+        ),
+      });
       expect(await send()).toBe(200);
+      const refreshLogs = fixture.host.harness.inspection.logEntries.filter(
+        (entry) =>
+          entry.message.includes(`account ${fixture.account.id} OAuth refresh`),
+      );
+      expect(refreshLogs).toHaveLength(3);
+      const logText = JSON.stringify(refreshLogs);
+      for (const token of ["oauth-old", "oauth-new", "oauth-refresh"])
+        expect(logText).not.toContain(token);
     });
   });
 
@@ -4471,6 +4493,7 @@ describe("Account Pool plugin", () => {
         async (wire) => {
           const provider = wire === "claude" ? "claude" : "codex";
           const attempts: Array<string | null> = [];
+          const parentRetry = deferred();
           const fixture = await affinityFixture(
             provider,
             async (_input, init) => {
@@ -4480,6 +4503,7 @@ describe("Account Pool plugin", () => {
                   headers.get("authorization")?.slice(7) ??
                   null,
               );
+              if (attempts.length === 4) await parentRetry.promise;
               return attempts.length === 3
                 ? Response.json(
                     {},
@@ -4487,7 +4511,6 @@ describe("Account Pool plugin", () => {
                   )
                 : Response.json({});
             },
-            Date.now,
           );
           const send = (own: string, parent: string | null) => {
             const request = forkRequest(wire, own, parent);
@@ -4517,12 +4540,14 @@ describe("Account Pool plugin", () => {
                     (account) => account.id === fixture.account.id,
                   )?.status,
                 ).toBe("held");
+                expect(attempts).toHaveLength(4);
               },
               { interval: 5 },
             );
             const child = await send("child", "parent");
             expect(child.status).toBe(200);
             await child.text();
+            parentRetry.resolve();
             await (await paced).text();
             await (await send("child", "parent")).text();
             expect(attempts).toEqual([
@@ -4534,6 +4559,7 @@ describe("Account Pool plugin", () => {
               "sk-first",
             ]);
           } finally {
+            parentRetry.resolve();
             const response = await paced;
             if (!response.bodyUsed) await response.text();
           }
@@ -5503,7 +5529,9 @@ describe("Account Pool plugin", () => {
       accessToken: "oauth-new",
       refreshToken: "refresh-new",
     });
-    expect((await fs.stat(secretPath)).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await fs.stat(secretPath)).mode & 0o777).toBe(0o600);
+    }
   });
 
   it("refreshes unrelated accounts independently", async () => {

@@ -42,12 +42,12 @@ manifest.bb.description = "Balance new Claude and Codex conversations by account
 manifest.description = manifest.bb.description;
 manifest.repository = { type: "git", url: "https://github.com/stephendolan/bb.git", directory: "exported/account-pool-balanced" };
 manifest.scripts.build = "bb plugin build .";
-manifest.engines.bbPluginSdk = ">=0.5.29";
+manifest.engines.bbPluginSdk = `>=${sdkVersion}`;
 manifest.devDependencies.oxlint = "^1.0.0";
 await writeFile(join(target, "package.json"), JSON.stringify(manifest, null, 2) + "\n");
 const tsconfig = forkPluginTsconfig(JSON.parse(await readFile(join(source, "tsconfig.json"), "utf8")));
 await writeFile(join(target, "tsconfig.json"), JSON.stringify(tsconfig, null, 2) + "\n");
-await writeFile(join(target, ".gitignore"), "node_modules/\n");
+await writeFile(join(target, ".gitignore"), "node_modules/\n!src/fixtures/*.pem\n");
 console.log(`Exported ${items.length} registry components to ${target}`);
 
 const routingGuide = join(target, "skills/account-pool/references/accounts-and-routing.md");
