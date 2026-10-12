@@ -7012,16 +7012,44 @@ it("publishes pooled usage without a display plugin and does not invent unobserv
   );
   expect(result).toMatchObject({
     observedAt: null,
-    usage: {
-      status: "error",
-      message: "Usage has not been observed for this account.",
-    },
+    usage: { status: "ok", windows: [] },
   });
   expect(
     fixture.host.harness.registrations.experimental_publishedRpcMethods.map(
       (entry) => entry.method,
     ),
   ).toEqual([usageListMethod, usageFetchMethod]);
+});
+
+it("publishes one usage resource per subscription and withdraws disabled logins", async () => {
+  const fixture = await createFixture({
+    upstreamUrl: "https://upstream.example",
+    source: "import",
+    options: { importCredentials: async () => importedCredentials() },
+  });
+  const relogin = accountSchema.parse(
+    await fixture.host.harness.behavior.callRpc("account.add", {
+      provider: "claude",
+      source: { kind: "import" },
+      label: null,
+      priority: 100,
+    }),
+  );
+  const listed = async () =>
+    usageResourceListSchema
+      .parse(await fixture.host.harness.behavior.callRpc(usageListMethod, {}))
+      .resources.map((resource) => resource.id);
+  expect(await listed()).toEqual([fixture.account.id]);
+  await fixture.host.harness.behavior.callRpc("account.disable", {
+    id: fixture.account.id,
+  });
+  expect(await listed()).toEqual([relogin.id]);
+  await expect(
+    fixture.host.harness.behavior.callRpc(usageFetchMethod, {
+      resourceId: fixture.account.id,
+      refresh: true,
+    }),
+  ).rejects.toThrow("no longer exists");
 });
 
 it("publishes an empty shared usage group before any accounts or settings are configured", async () => {

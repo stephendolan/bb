@@ -5,8 +5,13 @@ import {
   usageSourceRpcContract,
   usageListMethod,
   usageFetchMethod,
-  type UsageResource,
+  type UsageMeasurement,
 } from "./usage-contract.js";
+
+type UsageWindow = Extract<
+  UsageMeasurement["usage"],
+  { status: "ok" }
+>["windows"][number];
 
 export function usageWindowLabel(
   minutes: number | null,
@@ -42,7 +47,149 @@ function accountKey(account: AccountSummary): string | null {
       : null;
 }
 
+export function usageAccounts(
+  accounts: readonly AccountSummary[],
+): AccountSummary[] {
+  const enabled = accounts.filter((account) => account.enabled);
+  const representatives = new Map<string, AccountSummary>();
+  for (const account of enabled) {
+    const key = accountKey(account);
+    if (key === null) continue;
+    const current = representatives.get(key);
+    if (current === undefined || reportsUsageBetter(account, current))
+      representatives.set(key, account);
+  }
+  return enabled.filter((account) => {
+    const key = accountKey(account);
+    return key === null || representatives.get(key) === account;
+  });
+}
+
+function reportsUsageBetter(
+  candidate: AccountSummary,
+  current: AccountSummary,
+): boolean {
+  if ((candidate.error === null) !== (current.error === null))
+    return candidate.error === null;
+  return (candidate.observedAt ?? -1) > (current.observedAt ?? -1);
+}
+
+function usageWindows(account: AccountSummary): UsageWindow[] {
+  const windows: UsageWindow[] = [];
+  const add = (
+    id: string,
+    label: string,
+    utilization: number | null,
+    reset: number | null,
+    model: string | null,
+  ) => {
+    if (utilization === null) return;
+    windows.push({
+      kind:
+        label === "Five-hour limit"
+          ? "five-hour"
+          : label === "Daily limit"
+            ? "daily"
+            : label.startsWith("Weekly")
+              ? "weekly"
+              : "custom",
+      id,
+      label,
+      usedPercent: Math.round(utilization * 100),
+      resetsAt: reset === null ? null : new Date(reset).toISOString(),
+      model,
+      cost: null,
+    });
+  };
+  if (account.limitWindows.length > 0) {
+    for (const window of account.limitWindows) {
+      add(
+        window.slot,
+        usageWindowLabel(window.windowMinutes, window.slot),
+        window.utilization,
+        window.resetAt,
+        null,
+      );
+    }
+  } else {
+    add(
+      "five-hour",
+      "Five-hour limit",
+      account.fiveHourUtilization,
+      account.fiveHourResetAt,
+      null,
+    );
+    add(
+      "weekly",
+      "Weekly limit",
+      account.sevenDayUtilization,
+      account.sevenDayResetAt,
+      null,
+    );
+  }
+  for (const [family, window] of Object.entries(account.familyWeekly)) {
+    if (window !== null)
+      add(
+        `weekly:${family}`,
+        `Weekly · ${family}`,
+        window.utilization,
+        window.resetAt,
+        family,
+      );
+  }
+  return windows;
+}
+
+export function usageMeasurement(account: AccountSummary): UsageMeasurement {
+  const accountFields = {
+    plan: account.subscriptionType
+      ? {
+          id: account.subscriptionType.toLowerCase(),
+          multiplier:
+            Number(account.rateLimitTier?.match(/max_(\d+)x/u)?.[1]) || null,
+        }
+      : null,
+    accountEmail: account.email,
+    planLabel: usagePlanLabel(account),
+  };
+  const measurement = {
+    accountKey: accountKey(account),
+    observedAt: account.observedAt,
+  };
+  if (account.error !== null)
+    return {
+      ...measurement,
+      usage: {
+        status: account.kind === "oauth" ? "expired" : "unauthenticated",
+        ...accountFields,
+      },
+    };
+  if (account.kind === "oauth" && account.observedAt === null)
+    return {
+      ...measurement,
+      usage: {
+        status: "error",
+        ...accountFields,
+        message: "Usage has not been observed for this account.",
+      },
+    };
+  return {
+    ...measurement,
+    usage: { status: "ok", ...accountFields, windows: usageWindows(account) },
+  };
+}
+
 export function registerUsageSource(bb: BbPluginApi, hub: AccountPoolHub) {
+  const enabledAccount = async (
+    resourceId: string,
+  ): Promise<AccountSummary> => {
+    const account = (await hub.status()).accounts.find(
+      (candidate) => candidate.id === resourceId,
+    );
+    if (account === undefined || !account.enabled)
+      throw new Error("Usage resource no longer exists.");
+    return account;
+  };
   bb.rpc.register(
     usageSourceRpcContract,
     {
@@ -50,7 +197,7 @@ export function registerUsageSource(bb: BbPluginApi, hub: AccountPoolHub) {
         const { accounts } = await hub.status();
         return {
           label: "Account Pooler",
-          resources: accounts.map((account) => ({
+          resources: usageAccounts(accounts).map((account) => ({
             id: account.id,
             accountKey: accountKey(account),
             providerId: account.provider === "claude" ? "claude-code" : "codex",
@@ -62,123 +209,9 @@ export function registerUsageSource(bb: BbPluginApi, hub: AccountPoolHub) {
         };
       },
       async [usageFetchMethod]({ resourceId, refresh }) {
-        if (
-          !(await hub.status()).accounts.some(
-            (account) => account.id === resourceId,
-          )
-        )
-          throw new Error("Usage resource no longer exists.");
+        await enabledAccount(resourceId);
         await hub.refreshUsage(resourceId, refresh);
-        const { accounts: allAccounts } = await hub.status();
-        const accounts = allAccounts.filter(
-          (account) => account.id === resourceId,
-        );
-        if (accounts.length === 0)
-          throw new Error("Usage resource no longer exists.");
-        const resources: UsageResource[] = accounts.map((account) => {
-          const windows: Extract<
-            UsageResource["usage"],
-            { status: "ok" }
-          >["windows"] = [];
-          const add = (
-            id: string,
-            label: string,
-            utilization: number | null,
-            reset: number | null,
-            model: string | null,
-          ) => {
-            if (utilization === null) return;
-            windows.push({
-              kind:
-                label === "Five-hour limit"
-                  ? "five-hour"
-                  : label === "Daily limit"
-                    ? "daily"
-                    : label.startsWith("Weekly")
-                      ? "weekly"
-                      : "custom",
-              id,
-              label,
-              usedPercent: Math.round(utilization * 100),
-              resetsAt: reset === null ? null : new Date(reset).toISOString(),
-              model,
-              cost: null,
-            });
-          };
-          if (account.limitWindows.length > 0) {
-            for (const window of account.limitWindows) {
-              add(
-                window.slot,
-                usageWindowLabel(window.windowMinutes, window.slot),
-                window.utilization,
-                window.resetAt,
-                null,
-              );
-            }
-          } else {
-            add(
-              "five-hour",
-              "Five-hour limit",
-              account.fiveHourUtilization,
-              account.fiveHourResetAt,
-              null,
-            );
-            add(
-              "weekly",
-              "Weekly limit",
-              account.sevenDayUtilization,
-              account.sevenDayResetAt,
-              null,
-            );
-          }
-          for (const [family, window] of Object.entries(account.familyWeekly)) {
-            if (window !== null)
-              add(
-                `weekly:${family}`,
-                `Weekly · ${family}`,
-                window.utilization,
-                window.resetAt,
-                family,
-              );
-          }
-          const accountFields = {
-            plan: account.subscriptionType
-              ? {
-                  id: account.subscriptionType.toLowerCase(),
-                  multiplier:
-                    Number(account.rateLimitTier?.match(/max_(\d+)x/u)?.[1]) ||
-                    null,
-                }
-              : null,
-            accountEmail: account.email,
-            planLabel: usagePlanLabel(account),
-          };
-          const error =
-            (account.error === null
-              ? null
-              : "Usage could not be collected for this account. Try refreshing usage.") ??
-            (account.observedAt === null
-              ? "Usage has not been observed for this account."
-              : null);
-          return {
-            id: account.id,
-            accountKey: accountKey(account),
-            providerId: account.provider === "claude" ? "claude-code" : "codex",
-            label: account.label,
-            scope: { kind: "shared" },
-            observedAt: account.observedAt,
-            usage:
-              error === null
-                ? { status: "ok", ...accountFields, windows }
-                : { status: "error", ...accountFields, message: error },
-          };
-        });
-        const resource = resources[0]!;
-        return {
-          accountKey: resource.accountKey,
-          observedAt: resource.observedAt,
-          usage: resource.usage,
-        };
+        return usageMeasurement(await enabledAccount(resourceId));
       },
     },
     {
