@@ -41,3 +41,7 @@ remaining quota. The balance margin defaults to five percentage points. Each
 conversation keeps its account across idle periods and restarts; account errors
 and exhausted quota pause the conversation instead of switching accounts.
 **Priority** retains ordered sticky fallback for new conversations.
+
+## Automatic retries
+
+Provider Retry uses pool recovery times. Inspect `bb provider-retry status` or `bb provider-retry explain <thread-id>`.
